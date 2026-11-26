@@ -390,7 +390,25 @@ impl Client {
         debug_assert!(peer == interface.get_id());
         interface.update_direct(None);
         interface.update_received(false);
-        match Self::_start(peer, key, token, conn_type, interface.clone()).await {
+        let res = match Self::_start(peer, key, token, conn_type, interface.clone(), false).await {
+            Err(err) if Self::may_fall_back_to_public(peer, &err.to_string(), &interface) => {
+                log::info!(
+                    "connecting to {peer} via the self-hosted server failed ({err}), trying the public server"
+                );
+                interface.update_direct(None);
+                interface.update_received(false);
+                match Self::_start(peer, key, token, conn_type, interface.clone(), true).await {
+                    Ok(x) => Ok(x),
+                    Err(public_err) => {
+                        log::info!("the public server did not reach {peer} either: {public_err}");
+                        // Both routes failed: the self-hosted one is the error the user knows.
+                        Err(err)
+                    }
+                }
+            }
+            res => res,
+        };
+        match res {
             Err(err) => {
                 let err_str = err.to_string();
                 if err_str.starts_with("Failed") {
@@ -415,13 +433,25 @@ impl Client {
         }
     }
 
-    /// Start a new connection.
+    // A peer named by address, or one the user already pinned to a server with `id@server`, has
+    // no public route to fall back to.
+    fn may_fall_back_to_public(peer: &str, err: &str, interface: &impl Interface) -> bool {
+        crate::is_public_fallback_error(err)
+            && !hbb_common::is_ip_str(peer)
+            && !hbb_common::is_domain_port_str(peer)
+            && interface.get_lch().read().unwrap().other_server.is_none()
+            && crate::public_fallback_enabled()
+    }
+
+    /// Start a new connection. `via_public` routes this attempt through the public server
+    /// with its key, for this attempt only: nothing about it is saved to the peer's config.
     async fn _start(
         peer: &str,
         key: &str,
         token: &str,
         conn_type: ConnType,
         interface: impl Interface,
+        via_public: bool,
     ) -> ResultType<(
         (
             Stream,
@@ -466,7 +496,15 @@ impl Client {
             ));
         }
 
-        let other_server = interface.get_lch().read().unwrap().other_server.clone();
+        let other_server = if via_public {
+            Some((
+                peer.to_owned(),
+                PUBLIC_SERVER.to_owned(),
+                config::RS_PUB_KEY.to_owned(),
+            ))
+        } else {
+            interface.get_lch().read().unwrap().other_server.clone()
+        };
         let (peer, other_server, key, token) = if let Some((a, b, c)) = other_server.as_ref() {
             (a.as_ref(), b.as_ref(), c.as_ref(), "")
         } else {

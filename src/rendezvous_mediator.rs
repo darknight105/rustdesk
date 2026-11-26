@@ -239,6 +239,9 @@ static SHOULD_EXIT: AtomicBool = AtomicBool::new(false);
 static MANUAL_RESTARTED: AtomicBool = AtomicBool::new(false);
 static MANUAL_RESTART_NOTIFY: Notify = Notify::const_new();
 static SENT_REGISTER_PK: AtomicBool = AtomicBool::new(false);
+// The public fallback server answered UUID_MISMATCH: this id belongs to another machine there.
+// Registration on it stops until the next restart, the id is never changed on its account.
+static FALLBACK_REFUSED: AtomicBool = AtomicBool::new(false);
 pub(crate) static NEEDS_DEPLOY: AtomicBool = AtomicBool::new(false);
 #[cfg(target_os = "android")]
 static NOTIFIED_NEEDS_DEPLOY: AtomicBool = AtomicBool::new(false);
@@ -299,6 +302,9 @@ pub struct RendezvousMediator {
     host: String,
     host_prefix: String,
     keep_alive: i32,
+    // The public server, registered on beside the self-hosted one so this peer stays reachable
+    // while that one is down. It never owns this machine's id or its global registration state.
+    fallback: bool,
 }
 
 impl RendezvousMediator {
@@ -349,26 +355,56 @@ impl RendezvousMediator {
                 && !crate::platform::installing_service()
             {
                 let mut futs = Vec::new();
-                let servers = Config::get_rendezvous_servers();
+                let servers = crate::get_register_servers();
+                // With the public fallback each server is retried on its own: the point of
+                // the fallback is to stay registered there while the self-hosted one fails.
+                let independent = servers.iter().any(|h| crate::is_public_fallback_host(h));
                 SHOULD_EXIT.store(false, Ordering::SeqCst);
                 MANUAL_RESTARTED.store(false, Ordering::SeqCst);
+                FALLBACK_REFUSED.store(false, Ordering::SeqCst);
                 for host in servers.clone() {
                     let server = server.clone();
                     let timeout = timeout.clone();
                     futs.push(tokio::spawn(async move {
-                        if let Err(err) = Self::start(server, host).await {
-                            let err = format!("rendezvous mediator error: {err}");
-                            // When user reboot, there might be below error, waiting too long
-                            // (CONNECT_TIMEOUT 18s) will make user think there is bug
-                            if err.contains("10054") || err.contains("11001") {
-                                // No such host is known. (os error 11001)
-                                // An existing connection was forcibly closed by the remote host. (os error 10054): also happens for UDP
-                                *timeout.write().unwrap() = 3000;
+                        loop {
+                            let started = Instant::now();
+                            let mut retry_after = CONNECT_TIMEOUT;
+                            if let Err(err) = Self::start(server.clone(), host.clone()).await {
+                                let err = format!("rendezvous mediator error: {err}");
+                                // When user reboot, there might be below error, waiting too long
+                                // (CONNECT_TIMEOUT 18s) will make user think there is bug
+                                if err.contains("10054") || err.contains("11001") {
+                                    // No such host is known. (os error 11001)
+                                    // An existing connection was forcibly closed by the remote host. (os error 10054): also happens for UDP
+                                    retry_after = 3000;
+                                    if !independent {
+                                        *timeout.write().unwrap() = retry_after;
+                                    }
+                                }
+                                log::error!("{err}");
                             }
-                            log::error!("{err}");
+                            if !independent {
+                                // SHOULD_EXIT here is to ensure once one exits, the others also exit.
+                                SHOULD_EXIT.store(true, Ordering::SeqCst);
+                                break;
+                            }
+                            if crate::is_public_fallback_host(&host)
+                                && FALLBACK_REFUSED.load(Ordering::SeqCst)
+                            {
+                                break;
+                            }
+                            // This server is down, the other one may well be up: only this
+                            // one's state goes offline.
+                            Config::update_latency(&check_port(&host, RENDEZVOUS_PORT), -1);
+                            while !SHOULD_EXIT.load(Ordering::SeqCst)
+                                && (started.elapsed().as_millis() as u64) < retry_after
+                            {
+                                sleep(1.).await;
+                            }
+                            if SHOULD_EXIT.load(Ordering::SeqCst) {
+                                break;
+                            }
                         }
-                        // SHOULD_EXIT here is to ensure once one exits, the others also exit.
-                        SHOULD_EXIT.store(true, Ordering::SeqCst);
                     }));
                 }
                 join_all(futs).await;
@@ -413,6 +449,7 @@ impl RendezvousMediator {
             host: host.clone(),
             host_prefix: Self::get_host_prefix(&host),
             keep_alive: crate::DEFAULT_KEEP_ALIVE,
+            fallback: crate::is_public_fallback_host(&host),
         };
 
         let mut timer = crate::rustdesk_interval(interval(crate::TIMER_OUT));
@@ -481,7 +518,7 @@ impl RendezvousMediator {
                     // DEPLOY_RETRY_INTERVAL elapses, otherwise the loop spins every
                     // few seconds (log spam + misapplied network-recovery rebind)
                     // until the operator runs `rustdesk --deploy`.
-                    if deploy_register_throttled().await {
+                    if !rz.fallback && deploy_register_throttled().await {
                         continue;
                     }
                     let now = Some(Instant::now());
@@ -489,7 +526,7 @@ impl RendezvousMediator {
                     let timeout = last_register_sent.map(|x| x.elapsed().as_millis() as i64 >= reg_timeout).unwrap_or(false);
                     // temporarily disable exponential backoff for android before we add wakeup trigger to force connect in android
                     #[cfg(not(any(target_os = "android", target_os = "ios")))]
-                    if crate::using_public_server() { // only turn on this for public server, may help DDNS self-hosting user.
+                    if crate::using_public_server() || rz.fallback { // only turn on this for public server, may help DDNS self-hosting user.
                         if timeout && reg_timeout < MAX_REG_TIMEOUT {
                             reg_timeout += MIN_REG_TIMEOUT;
                         }
@@ -543,6 +580,9 @@ impl RendezvousMediator {
             Some(rendezvous_message::Union::RegisterPkResponse(rpr)) => {
                 update_latency();
                 match rpr.result.enum_value() {
+                    Ok(register_pk_response::Result::OK) if self.fallback => {
+                        Config::set_host_key_confirmed(&self.host_prefix, true);
+                    }
                     Ok(register_pk_response::Result::OK) => {
                         Config::set_key_confirmed(true);
                         Config::set_host_key_confirmed(&self.host_prefix, true);
@@ -553,6 +593,9 @@ impl RendezvousMediator {
                     }
                     Ok(register_pk_response::Result::UUID_MISMATCH) => {
                         self.handle_uuid_mismatch(sink).await?;
+                    }
+                    Ok(register_pk_response::Result::NOT_DEPLOYED) if self.fallback => {
+                        Config::set_host_key_confirmed(&self.host_prefix, false);
                     }
                     Ok(register_pk_response::Result::NOT_DEPLOYED) => {
                         if !NEEDS_DEPLOY.load(Ordering::SeqCst) {
@@ -630,14 +673,15 @@ impl RendezvousMediator {
         let host = check_port(&host, RENDEZVOUS_PORT);
         log::info!("start tcp: {}", hbb_common::websocket::check_ws(&host));
         let mut conn = connect_tcp(host.clone(), CONNECT_TIMEOUT).await?;
-        let key = crate::get_key(true).await;
-        crate::secure_tcp(&mut conn, &key).await?;
         let mut rz = Self {
             addr: conn.local_addr().into_target_addr()?,
             host: host.clone(),
             host_prefix: Self::get_host_prefix(&host),
             keep_alive: crate::DEFAULT_KEEP_ALIVE,
+            fallback: crate::is_public_fallback_host(&host),
         };
+        let key = rz.key().await;
+        crate::secure_tcp(&mut conn, &key).await?;
         let mut timer = crate::rustdesk_interval(interval(crate::TIMER_OUT));
         let mut last_register_sent: Option<Instant> = None;
         let mut last_recv_msg = Instant::now();
@@ -672,8 +716,7 @@ impl RendezvousMediator {
                     if last_recv_msg.elapsed().as_millis() as u64 > rz.keep_alive as u64 * 3 / 2 {
                         bail!("Rendezvous connection is timeout");
                     }
-                    if (!Config::get_key_confirmed() ||
-                        !Config::get_host_key_confirmed(&rz.host_prefix)) &&
+                    if !rz.key_confirmed() &&
                         last_register_sent.map(|x| x.elapsed().as_millis() as i64).unwrap_or(REG_INTERVAL) >= REG_INTERVAL {
                         rz.register_pk(Sink::Stream(&mut conn)).await?;
                         last_register_sent = Some(Instant::now());
@@ -758,7 +801,7 @@ impl RendezvousMediator {
         // controller falls back to its other transports.
         let mut webrtc_sdp_answer = webrtc_sdp_answer;
         if !webrtc_sdp_answer.is_empty() {
-            let key = crate::get_key(true).await;
+            let key = self.key().await;
             if let Err(err) = crate::secure_tcp_required(&mut socket, &key).await {
                 log::warn!("relaying without the WebRTC answer, it cannot be encrypted: {err}");
                 webrtc_sdp_answer = String::new();
@@ -789,6 +832,7 @@ impl RendezvousMediator {
             secure,
             is_ipv4(&self.addr),
             meta,
+            self.key().await,
         )
         .await;
         Ok(())
@@ -963,6 +1007,7 @@ impl RendezvousMediator {
 
         {
             let host = self.host.clone();
+            let key = self.key().await;
             let socket_addr = return_route.clone();
             let session_key_for_ice = session_key.clone();
             tokio::spawn(async move {
@@ -974,7 +1019,6 @@ impl RendezvousMediator {
                 // trickle, and TCP reliability replaces the old 400ms duplicate re-send
                 // (the controller keeps its own re-send for the server->peer UDP downlink).
                 let mut conn = None;
-                let key = crate::get_key(true).await;
                 while let Some(candidate) = local_ice_rx.recv().await {
                     let mut msg = Message::new();
                     msg.set_ice_candidate(IceCandidate {
@@ -1204,7 +1248,7 @@ impl RendezvousMediator {
             let mut socket = connect_tcp(&*self.host, CONNECT_TIMEOUT).await?;
             // The answer goes out only on a channel that is actually encrypted; otherwise this
             // WebRTC attempt is abandoned and the controller falls back to its other transports.
-            crate::secure_tcp_required(&mut socket, &crate::get_key(true).await).await?;
+            crate::secure_tcp_required(&mut socket, &self.key().await).await?;
             socket.send(&msg_out).await?;
             return Ok(());
         }
@@ -1292,7 +1336,9 @@ impl RendezvousMediator {
         // already told us we're not in its db; sending more often than every
         // DEPLOY_RETRY_INTERVAL ms is wasted traffic until the operator runs
         // `rustdesk --deploy --token <api_token>`.
-        if NEEDS_DEPLOY.load(Ordering::SeqCst) {
+        if self.fallback {
+            // The deployment gate is the self-hosted server's, not the public one's.
+        } else if NEEDS_DEPLOY.load(Ordering::SeqCst) {
             let mut last = LAST_NOT_DEPLOYED_REGISTER.lock().await;
             if let Some(t) = *last {
                 if (t.elapsed().as_millis() as i64) < DEPLOY_RETRY_INTERVAL {
@@ -1320,6 +1366,16 @@ impl RendezvousMediator {
     }
 
     async fn handle_uuid_mismatch(&mut self, socket: Sink<'_>) -> ResultType<()> {
+        if self.fallback {
+            // Another machine holds this id on the public server. The id is the self-hosted
+            // server's to decide, so give up the fallback instead of changing it.
+            FALLBACK_REFUSED.store(true, Ordering::SeqCst);
+            bail!(
+                "id {} is taken on {}, public fallback is off until restart",
+                Config::get_id(),
+                self.host
+            );
+        }
         {
             let mut solving = SOLVING_PK_MISMATCH.lock().await;
             if solving.is_empty() || *solving == self.host {
@@ -1340,7 +1396,7 @@ impl RendezvousMediator {
             return Ok(());
         }
         drop(solving);
-        if !Config::get_key_confirmed() || !Config::get_host_key_confirmed(&self.host_prefix) {
+        if !self.key_confirmed() {
             log::info!(
                 "register_pk of {} due to key not confirmed",
                 self.host_prefix
@@ -1364,8 +1420,29 @@ impl RendezvousMediator {
         Ok(())
     }
 
+    // The key of the server this mediator talks to: the public server has its own.
+    async fn key(&self) -> String {
+        if self.fallback {
+            config::RS_PUB_KEY.to_owned()
+        } else {
+            crate::get_key(true).await
+        }
+    }
+
+    // The global flag follows the self-hosted server only, the fallback keeps to its own.
+    fn key_confirmed(&self) -> bool {
+        (self.fallback || Config::get_key_confirmed())
+            && Config::get_host_key_confirmed(&self.host_prefix)
+    }
+
     fn get_relay_server(&self, provided_by_rendezvous_server: String) -> String {
-        let mut relay_server = Config::get_option("relay-server");
+        // The `relay-server` option names the self-hosted relay, which the public server's
+        // peers cannot be sent to.
+        let mut relay_server = if self.fallback {
+            String::new()
+        } else {
+            Config::get_option("relay-server")
+        };
         if relay_server.is_empty() {
             relay_server = provided_by_rendezvous_server;
         }
@@ -1833,6 +1910,7 @@ mod tests {
             host: host.to_string(),
             host_prefix: String::new(),
             keep_alive: 0,
+            fallback: false,
         };
         let msg_punch = PunchHoleSent {
             webrtc_sdp_answer: "answer".to_owned(),
@@ -1899,6 +1977,7 @@ mod tests {
             host: host.to_string(),
             host_prefix: String::new(),
             keep_alive: 0,
+            fallback: false,
         };
         let now = Instant::now();
         super::remember_reported_relay("reported-relay.example", now);

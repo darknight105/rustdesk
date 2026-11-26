@@ -2460,6 +2460,55 @@ pub fn using_public_server() -> bool {
     crate::get_custom_rendezvous_server(get_option("custom-rendezvous-server")).is_empty()
 }
 
+/// Set to "N" to turn the public-server fallback off; any other value leaves it on.
+pub const OPTION_ALLOW_PUBLIC_FALLBACK: &str = "allow-public-fallback";
+
+// The fallback only makes sense beside a self-hosted server: with a public server already in
+// the list there is nothing to fall back to.
+fn public_fallback_allowed(option: &str, servers: &[String]) -> bool {
+    option != "N" && !servers.is_empty() && !servers.iter().any(|s| is_public(s))
+}
+
+/// The servers to register on: the configured ones, plus the public server as a fallback when
+/// they are all self-hosted.
+pub fn with_public_fallback(mut servers: Vec<String>, option: &str) -> Vec<String> {
+    if public_fallback_allowed(option, &servers) {
+        servers.push(config::RENDEZVOUS_SERVERS[0].to_owned());
+    }
+    servers
+}
+
+/// Controlled side (the process that owns the config): the rendezvous servers to register on.
+pub fn get_register_servers() -> Vec<String> {
+    with_public_fallback(
+        Config::get_rendezvous_servers(),
+        &Config::get_option(OPTION_ALLOW_PUBLIC_FALLBACK),
+    )
+}
+
+/// Controlled side: whether `host` is the public server registered on only as a fallback.
+pub fn is_public_fallback_host(host: &str) -> bool {
+    is_public(host)
+        && !Config::get_rendezvous_servers()
+            .iter()
+            .any(|s| is_public(s))
+}
+
+/// Controlling side: whether a failed connection through the self-hosted server may be retried
+/// through the public one.
+pub fn public_fallback_enabled() -> bool {
+    let custom = crate::get_custom_rendezvous_server(get_option("custom-rendezvous-server"));
+    !custom.is_empty()
+        && public_fallback_allowed(&get_option(OPTION_ALLOW_PUBLIC_FALLBACK), &[custom])
+}
+
+/// Whether an error from the self-hosted route is worth a retry through the public server.
+/// Anything about reachability is; a refusal that the public server cannot change is not.
+pub fn is_public_fallback_error(err: &str) -> bool {
+    const FINAL: [&str; 4] = ["Key mismatch", "Key overuse", "Incoming only mode", "MITM"];
+    !FINAL.iter().any(|x| err.contains(x))
+}
+
 pub struct ThrottledInterval {
     interval: Interval,
     next_tick: Instant,
@@ -3272,6 +3321,50 @@ mod tests {
         assert!(!is_public("hello-rustdesk.com"));
         assert!(!is_public("api.rustdesk.com.evil.test"));
         assert!(!is_public("https://rustdesk.com@evil.test"));
+    }
+
+    #[test]
+    fn public_server_is_appended_only_beside_self_hosted_servers() {
+        let public = config::RENDEZVOUS_SERVERS[0].to_owned();
+        let own = vec!["hbbs.example.com".to_owned()];
+        assert_eq!(
+            with_public_fallback(own.clone(), ""),
+            vec![own[0].clone(), public.clone()],
+            "the self-hosted server stays first"
+        );
+        assert_eq!(with_public_fallback(own.clone(), "Y"), vec![own[0].clone(), public.clone()]);
+        assert_eq!(with_public_fallback(own.clone(), "N"), own, "the option turns it off");
+        assert_eq!(
+            with_public_fallback(vec![public.clone()], ""),
+            vec![public.clone()],
+            "no duplicate when already on the public server"
+        );
+        assert_eq!(
+            with_public_fallback(vec!["rs-sg.rustdesk.com:21116".to_owned()], ""),
+            vec!["rs-sg.rustdesk.com:21116".to_owned()]
+        );
+        assert!(with_public_fallback(Vec::new(), "").is_empty());
+    }
+
+    #[test]
+    fn only_reachability_errors_fall_back_to_the_public_server() {
+        for err in [
+            "ID does not exist",
+            "Remote desktop is offline",
+            "Failed to connect via rendezvous server",
+            "Timeout",
+            "deadline has elapsed",
+        ] {
+            assert!(is_public_fallback_error(err), "{err}");
+        }
+        for err in [
+            "Key mismatch",
+            "Key overuse",
+            "Incoming only mode",
+            "WebRTC handshake id mismatch (possible MITM)",
+        ] {
+            assert!(!is_public_fallback_error(err), "{err}");
+        }
     }
 
     #[test]
